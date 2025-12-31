@@ -4,10 +4,12 @@ import torch
 import joblib
 import numpy as np
 import pandas as pd
+from io import StringIO
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from werkzeug.utils import secure_filename
+from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Dict, Any, Optional, List
 
 # =====================
 # PYTHON PATH FIX
@@ -28,21 +30,45 @@ from ml.decision_engine import decision_intelligence
 from ml.action_engine import generate_actions, classify_maintenance_urgency, estimate_delay_impact
 from ml.batch_predictor import predict_batch
 
-app = Flask(__name__)
-CORS(app)
+# =====================
+# FASTAPI APP
+# =====================
+app = FastAPI(
+    title="Smart Manufacturing API",
+    description="PyTorch Manufacturing Failure Predictor",
+    version="1.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with specific origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =====================
+# PYDANTIC MODELS
+# =====================
+class PredictionRequest(BaseModel):
+    """Model for single prediction request"""
+    data: Dict[str, Any]
+
+class AnalyzeMachineRequest(BaseModel):
+    """Model for machine analysis request"""
+    features: Dict[str, Any]
+    risk_score: int
+
+class SimulationRequest(BaseModel):
+    """Model for what-if simulation request"""
+    base_features: Dict[str, Any]
+    modifications: Dict[str, Any]
 
 # =====================
 # PATH SETUP
 # =====================
-# Get the directory where this script is located (Backend/app/api)
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Go up one level to Backend/app
-APP_DIR = os.path.dirname(SCRIPT_DIR)
-
-# Artifacts directory
 ARTIFACT_DIR = os.path.join(APP_DIR, "models_artifacts")
-
 print(f"Loading artifacts from: {ARTIFACT_DIR}")
 
 # =====================
@@ -75,61 +101,66 @@ if missing_files:
     print("  python ml/train_torch.py")
     print("\nfrom the Backend/app directory")
     print("="*60)
-    exit(1)
+    # Don't exit, let FastAPI start anyway for health checks
 
 # =====================
 # LOAD ARTIFACTS
 # =====================
-print("\nLoading model artifacts...")
-scaler = joblib.load(os.path.join(ARTIFACT_DIR, "torch_scaler.pkl"))
-print("  ✅ Scaler loaded")
+scaler = None
+label_encoders = None
+columns = None
+model = None
 
-label_encoders = joblib.load(os.path.join(ARTIFACT_DIR, "torch_label_encoders.pkl"))
-print(f"  ✅ Label encoders loaded ({len(label_encoders)} encoders)")
+try:
+    print("\nLoading model artifacts...")
+    scaler = joblib.load(os.path.join(ARTIFACT_DIR, "torch_scaler.pkl"))
+    print("  ✅ Scaler loaded")
 
-columns = joblib.load(os.path.join(ARTIFACT_DIR, "torch_columns.pkl"))
-print(f"  ✅ Columns loaded ({len(columns)} features)")
+    label_encoders = joblib.load(os.path.join(ARTIFACT_DIR, "torch_label_encoders.pkl"))
+    print(f"  ✅ Label encoders loaded ({len(label_encoders)} encoders)")
 
-# =====================
-# PYTORCH MODEL
-# =====================
-class ManufacturingNet(torch.nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(input_dim, 64),
-            torch.nn.ReLU(),
-            torch.nn.BatchNorm1d(64),
-            torch.nn.Dropout(0.2),
-            torch.nn.Linear(64, 32),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.2),
-            torch.nn.Linear(32, 1)
-        )
+    columns = joblib.load(os.path.join(ARTIFACT_DIR, "torch_columns.pkl"))
+    print(f"  ✅ Columns loaded ({len(columns)} features)")
 
-    def forward(self, x):
-        return self.net(x)
+    # =====================
+    # PYTORCH MODEL
+    # =====================
+    class ManufacturingNet(torch.nn.Module):
+        def __init__(self, input_dim):
+            super().__init__()
+            self.net = torch.nn.Sequential(
+                torch.nn.Linear(input_dim, 64),
+                torch.nn.ReLU(),
+                torch.nn.BatchNorm1d(64),
+                torch.nn.Dropout(0.2),
+                torch.nn.Linear(64, 32),
+                torch.nn.ReLU(),
+                torch.nn.Dropout(0.2),
+                torch.nn.Linear(32, 1)
+            )
 
-model = ManufacturingNet(input_dim=len(columns))
+        def forward(self, x):
+            return self.net(x)
 
-# Robust model loading: support both state_dict and full model files
-model_path = os.path.join(ARTIFACT_DIR, "torch_failure_model_best.pt")
-loaded = torch.load(model_path, map_location=torch.device("cpu"))
+    model = ManufacturingNet(input_dim=len(columns))
 
-if isinstance(loaded, dict):
-    # Assume it's a state_dict
-    model.load_state_dict(loaded)
-else:
-    # Assume it's a full model object — replace our instance
-    try:
-        model = loaded
-    except Exception:
-        # Fall back to loading state_dict from object's state_dict()
-        if hasattr(loaded, 'state_dict'):
-            model.load_state_dict(loaded.state_dict())
+    # Robust model loading
+    model_path = os.path.join(ARTIFACT_DIR, "torch_failure_model_best.pt")
+    loaded = torch.load(model_path, map_location=torch.device("cpu"))
 
-model.eval()
-print("  ✅ PyTorch model loaded")
+    if isinstance(loaded, dict):
+        model.load_state_dict(loaded)
+    else:
+        try:
+            model = loaded
+        except Exception:
+            if hasattr(loaded, 'state_dict'):
+                model.load_state_dict(loaded.state_dict())
+
+    model.eval()
+    print("  ✅ PyTorch model loaded")
+except Exception as e:
+    print(f"⚠️  Warning: Could not load models: {str(e)}")
 
 # =====================
 # HELPER: PREPROCESS INPUT
@@ -139,6 +170,9 @@ def preprocess_input(data: dict):
     Preprocess input data for model prediction.
     Handles categorical encoding and scaling.
     """
+    if not all([scaler, label_encoders, columns]):
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
     row = {}
 
     for col in columns:
@@ -150,13 +184,11 @@ def preprocess_input(data: dict):
         # Handle categorical features
         if col in label_encoders:
             le = label_encoders[col]
-            # Convert to string for encoding
             value_str = str(value)
             
-            # Check if value is known
             if value_str not in le.classes_:
                 print(f"Warning: Unknown value '{value}' for {col}, using fallback")
-                value_str = le.classes_[0]  # Use first known value as fallback
+                value_str = le.classes_[0]
             
             value = le.transform([value_str])[0]
 
@@ -171,32 +203,43 @@ def preprocess_input(data: dict):
 # =====================
 # API ENDPOINTS
 # =====================
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({
+@app.get("/")
+def read_root():
+    """Root endpoint - API information"""
+    return {
         "status": "running",
+        "message": "API is running",
         "model": "PyTorch Manufacturing Failure Predictor",
-        "features": len(columns),
-        "categorical_features": len(label_encoders),
+        "features": len(columns) if columns else 0,
+        "categorical_features": len(label_encoders) if label_encoders else 0,
+        "model_loaded": model is not None,
         "endpoints": {
+            "/": "GET - API info",
+            "/health": "GET - Health check",
+            "/features": "GET - Get required features",
             "/predict/torch": "POST - Single prediction",
             "/upload-csv": "POST - Batch CSV prediction",
-            "/health": "GET - Check model health",
-            "/features": "GET - Get required features"
+            "/analyze_machine": "POST - Machine analysis",
+            "/simulate": "POST - What-if simulation"
         }
-    })
+    }
 
-@app.route("/health", methods=["GET"])
+@app.get("/health")
 def health():
-    return jsonify({
+    """Health check endpoint"""
+    return {
         "status": "healthy",
-        "model_loaded": True,
-        "features_count": len(columns),
-        "encoders_count": len(label_encoders)
-    })
+        "model_loaded": model is not None,
+        "features_count": len(columns) if columns else 0,
+        "encoders_count": len(label_encoders) if label_encoders else 0
+    }
 
-@app.route("/features", methods=["GET"])
+@app.get("/features")
 def get_features():
+    """Get list of all required features"""
+    if not columns:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
     feature_info = []
     for col in columns:
         info = {
@@ -207,76 +250,74 @@ def get_features():
             info["possible_values"] = label_encoders[col].classes_.tolist()
         feature_info.append(info)
     
-    return jsonify({
+    return {
         "features": feature_info,
         "total_count": len(columns)
-    })
+    }
 
-@app.route("/upload-csv", methods=["POST"])
-def upload_csv():
+@app.post("/upload-csv")
+async def upload_csv(file: UploadFile = File(...)):
     """
     Process CSV file with batch machine failure predictions.
     
-    Uses batch_predictor module for clean separation of prediction logic.
-    Returns failure probability, risk classification, explainability, and actions
-    for each machine in the CSV.
+    Returns failure probability, risk classification, explainability, 
+    and actions for each machine in the CSV.
     """
     try:
-        if "file" not in request.files:
-            return jsonify({"error": "No file uploaded"}), 400
-
-        file = request.files["file"]
-
         if not file.filename.endswith(".csv"):
-            return jsonify({"error": "Only CSV files are supported"}), 400
+            raise HTTPException(status_code=400, detail="Only CSV files are supported")
+
+        if not all([model, scaler, label_encoders, columns]):
+            raise HTTPException(status_code=503, detail="Model not loaded")
 
         # Read CSV
-        df = pd.read_csv(file)
+        contents = await file.read()
+        df = pd.read_csv(StringIO(contents.decode('utf-8')))
 
-        # Use batch predictor module (clean separation of concerns)
+        # Use batch predictor module
         batch_results = predict_batch(
             df=df,
             model=model,
             scaler=scaler,
             label_encoders=label_encoders,
             columns=columns,
-            verbose=True  # Print statistics to console
+            verbose=True
         )
 
-        return jsonify({
+        return {
             "total_rows": batch_results["total_rows"],
             "processed_rows": batch_results["processed_rows"],
             "errors": batch_results["errors"],
             "statistics": batch_results["statistics"],
             "results": batch_results["results"]
-        })
+        }
 
     except Exception as e:
-        return jsonify({
-            "error": "CSV processing failed",
-            "message": str(e)
-        }), 500
+        raise HTTPException(
+            status_code=500,
+            detail=f"CSV processing failed: {str(e)}"
+        )
 
-@app.route("/predict/torch", methods=["POST"])
-def predict_torch():
+@app.post("/predict/torch")
+def predict_torch(request: Dict[str, Any]):
+    """Single machine prediction endpoint"""
     try:
-        data = request.json
+        if not request:
+            raise HTTPException(status_code=400, detail="No data provided")
 
-        if not data:
-            return jsonify({"error": "No data provided"}), 400
+        if not all([model, scaler, label_encoders, columns]):
+            raise HTTPException(status_code=503, detail="Model not loaded")
 
-        x = preprocess_input(data)
+        x = preprocess_input(request)
 
         with torch.no_grad():
             logits = model(x)
             raw_score = logits.item()
-            
-            # Apply sigmoid to convert logit to probability [0, 1]
             failure_probability = torch.sigmoid(logits).item()
 
         risk_score = int(failure_probability * 100)
 
-        # Calibrated thresholds: High >= 65%, Medium >= 40%, Low < 40%
+        # Calibrated thresholds
         if risk_score >= 65:
             maintenance_priority = "High"
         elif risk_score >= 40:
@@ -284,25 +325,20 @@ def predict_torch():
         else:
             maintenance_priority = "Low"
 
-        # Extract top contributing risk factors (using new explainability module)
+        # Extract top contributing risk factors
         top_factors = get_top_contributing_features(model, x, columns, top_k=3)
         
-        # Generate human-readable explanations (uses mapped sensor names and top factors)
-        explanations, mapping = explain_machine(data, top_factors, columns)
-        # Temporary debug print to verify per-machine output
-        try:
-            print(data.get("Id", data.get("id", "unknown")), explanations)
-        except Exception:
-            pass
+        # Generate explanations
+        explanations, mapping = explain_machine(request, top_factors, columns)
         
-        # Get recommended actions (using new action engine module)
+        # Get recommended actions
         recommended_actions = generate_actions(maintenance_priority, top_factors)
         
         # Get urgency context
         urgency_info = classify_maintenance_urgency(maintenance_priority, failure_probability)
         delay_impact = estimate_delay_impact(maintenance_priority, top_factors)
 
-        return jsonify({
+        return {
             "model": "pytorch",
             "raw_score": round(raw_score, 2),
             "failure_probability": round(failure_probability, 4),
@@ -317,54 +353,41 @@ def predict_torch():
             "delay_impact": delay_impact,
             "input_features": len(columns),
             "status": "success"
-        })
+        }
 
     except Exception as e:
-        return jsonify({
-            "error": "Prediction failed",
-            "message": str(e)
-        }), 500
+        raise HTTPException(
+            status_code=500,
+            detail=f"Prediction failed: {str(e)}"
+        )
 
-@app.route("/analyze_machine", methods=["POST"])
-def analyze_machine():
+@app.post("/analyze_machine")
+def analyze_machine(request: AnalyzeMachineRequest):
+    """Machine analysis endpoint"""
     try:
-        data = request.json
-
-        if not data or "features" not in data or "risk_score" not in data:
-            return jsonify({"error": "Missing 'features' or 'risk_score' in request"}), 400
-
-        features = data.get("features", {})
-        risk_score = int(data.get("risk_score", 0))
+        features = request.features
+        risk_score = request.risk_score
 
         decision = decision_intelligence(features, risk_score)
-
-        return jsonify(decision)
+        return decision
 
     except Exception as e:
-        return jsonify({"error": "Analysis failed", "message": str(e)}), 500
+        raise HTTPException(
+            status_code=500,
+            detail=f"Analysis failed: {str(e)}"
+        )
 
-@app.route("/simulate", methods=["POST"])
-def simulate():
+@app.post("/simulate")
+def simulate(request: SimulationRequest):
     """
     What-if analysis: Show how risk changes when features are modified.
-    
-    Request body:
-    {
-        "base_features": {...current values...},
-        "modifications": {"vibration": 0.2, "temperature": 25}
-    }
-    
-    Returns:
-        Original risk score and new risk score after modifications
     """
     try:
-        data = request.json
+        if not all([model, scaler, label_encoders, columns]):
+            raise HTTPException(status_code=503, detail="Model not loaded")
         
-        if not data or "base_features" not in data:
-            return jsonify({"error": "Missing 'base_features'"}), 400
-        
-        base_features = data.get("base_features", {})
-        modifications = data.get("modifications", {})
+        base_features = request.base_features
+        modifications = request.modifications
         
         # Create modified feature dict
         modified_features = base_features.copy()
@@ -385,7 +408,7 @@ def simulate():
         # Calculate impact
         risk_delta = modified_risk - original_risk
         
-        return jsonify({
+        return {
             "original_risk_score": original_risk,
             "original_failure_probability": round(original_prob, 4),
             "modified_risk_score": modified_risk,
@@ -394,24 +417,26 @@ def simulate():
             "improvement": risk_delta < 0,
             "modifications_applied": modifications,
             "status": "success"
-        })
+        }
     
     except Exception as e:
-        return jsonify({
-            "error": "Simulation failed",
-            "message": str(e)
-        }), 500
+        raise HTTPException(
+            status_code=500,
+            detail=f"Simulation failed: {str(e)}"
+        )
 
 # =====================
-# RUN APP
+# STARTUP EVENT
 # =====================
-if __name__ == "__main__":
+@app.on_event("startup")
+async def startup_event():
     print("\n" + "="*60)
-    print("🚀 Flask API Server Starting")
+    print("🚀 FastAPI Server Starting")
     print("="*60)
-    print(f"Model artifacts loaded from: {ARTIFACT_DIR}")
-    print(f"Features: {len(columns)}")
-    print(f"Categorical features: {len(label_encoders)}")
+    print(f"Model artifacts path: {ARTIFACT_DIR}")
+    print(f"Features: {len(columns) if columns else 0}")
+    print(f"Categorical features: {len(label_encoders) if label_encoders else 0}")
+    print(f"Model loaded: {model is not None}")
     print("\nEndpoints:")
     print("  GET  /           - API info")
     print("  GET  /health     - Health check")
@@ -420,7 +445,5 @@ if __name__ == "__main__":
     print("  POST /upload-csv - Batch CSV predictions")
     print("  POST /analyze_machine - Machine analysis")
     print("  POST /simulate   - What-if simulation")
+    print("  GET  /docs       - Interactive API documentation")
     print("="*60 + "\n")
-    
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
