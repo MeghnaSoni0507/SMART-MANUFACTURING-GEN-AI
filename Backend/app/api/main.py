@@ -32,13 +32,6 @@ app = Flask(__name__)
 CORS(app)
 
 # =====================
-# HEALTH CHECK ENDPOINT
-# =====================
-@app.route("/")
-def health():
-    return {"status": "running"}
-
-# =====================
 # PATH SETUP
 # =====================
 # Get the directory where this script is located (Backend/app/api)
@@ -119,7 +112,6 @@ class ManufacturingNet(torch.nn.Module):
 
 model = ManufacturingNet(input_dim=len(columns))
 
-
 # Robust model loading: support both state_dict and full model files
 model_path = os.path.join(ARTIFACT_DIR, "torch_failure_model_best.pt")
 loaded = torch.load(model_path, map_location=torch.device("cpu"))
@@ -194,6 +186,32 @@ def home():
         }
     })
 
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "healthy",
+        "model_loaded": True,
+        "features_count": len(columns),
+        "encoders_count": len(label_encoders)
+    })
+
+@app.route("/features", methods=["GET"])
+def get_features():
+    feature_info = []
+    for col in columns:
+        info = {
+            "name": col,
+            "type": "categorical" if col in label_encoders else "numerical"
+        }
+        if col in label_encoders:
+            info["possible_values"] = label_encoders[col].classes_.tolist()
+        feature_info.append(info)
+    
+    return jsonify({
+        "features": feature_info,
+        "total_count": len(columns)
+    })
+
 @app.route("/upload-csv", methods=["POST"])
 def upload_csv():
     """
@@ -238,32 +256,6 @@ def upload_csv():
             "error": "CSV processing failed",
             "message": str(e)
         }), 500
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({
-        "status": "healthy",
-        "model_loaded": True,
-        "features_count": len(columns),
-        "encoders_count": len(label_encoders)
-    })
-
-@app.route("/features", methods=["GET"])
-def get_features():
-    feature_info = []
-    for col in columns:
-        info = {
-            "name": col,
-            "type": "categorical" if col in label_encoders else "numerical"
-        }
-        if col in label_encoders:
-            info["possible_values"] = label_encoders[col].classes_.tolist()
-        feature_info.append(info)
-    
-    return jsonify({
-        "features": feature_info,
-        "total_count": len(columns)
-    })
 
 @app.route("/predict/torch", methods=["POST"])
 def predict_torch():
@@ -333,7 +325,6 @@ def predict_torch():
             "message": str(e)
         }), 500
 
-
 @app.route("/analyze_machine", methods=["POST"])
 def analyze_machine():
     try:
@@ -352,9 +343,6 @@ def analyze_machine():
     except Exception as e:
         return jsonify({"error": "Analysis failed", "message": str(e)}), 500
 
-# =====================
-# WHAT-IF SIMULATION ENDPOINT
-# =====================
 @app.route("/simulate", methods=["POST"])
 def simulate():
     """
@@ -425,10 +413,13 @@ if __name__ == "__main__":
     print(f"Features: {len(columns)}")
     print(f"Categorical features: {len(label_encoders)}")
     print("\nEndpoints:")
-    print("  GET  /           - Health check")
+    print("  GET  /           - API info")
     print("  GET  /health     - Health check")
     print("  GET  /features   - List all features")
     print("  POST /predict/torch - Make predictions")
+    print("  POST /upload-csv - Batch CSV predictions")
+    print("  POST /analyze_machine - Machine analysis")
+    print("  POST /simulate   - What-if simulation")
     print("="*60 + "\n")
     
     port = int(os.environ.get("PORT", 5000))
