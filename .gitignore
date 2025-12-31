@@ -1,10 +1,17 @@
-﻿# Python cache
-__pycache__/
-*.pyc
-
-# Virtual environments
+﻿# Python
 venv/
 .venv/
-
-# Env files
+__pycache__/
+*.pyc
 .env
+
+# Node / Frontend
+node_modules/
+dist/
+build/
+
+# Editor
+.vscode/
+
+# OS
+.DS_Store
