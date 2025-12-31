@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { Upload, AlertCircle, CheckCircle, TrendingUp, Activity, Wrench, FileText, Download } from 'lucide-react';
 
 // API Configuration
-const API_BASE_URL = 'http://127.0.0.1:5000';
+const API_BASE_URL = "https://sm-backend-api.wittyground-8c4b53ab.centralindia.azurecontainerapps.io";
 
 const App = () => {
   const [file, setFile] = useState(null);

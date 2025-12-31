@@ -430,20 +430,42 @@ def simulate(request: SimulationRequest):
 # =====================
 @app.on_event("startup")
 async def startup_event():
-    print("\n" + "="*60)
-    print("🚀 FastAPI Server Starting")
-    print("="*60)
-    print(f"Model artifacts path: {ARTIFACT_DIR}")
-    print(f"Features: {len(columns) if columns else 0}")
-    print(f"Categorical features: {len(label_encoders) if label_encoders else 0}")
-    print(f"Model loaded: {model is not None}")
-    print("\nEndpoints:")
-    print("  GET  /           - API info")
-    print("  GET  /health     - Health check")
-    print("  GET  /features   - List all features")
-    print("  POST /predict/torch - Make predictions")
-    print("  POST /upload-csv - Batch CSV predictions")
-    print("  POST /analyze_machine - Machine analysis")
-    print("  POST /simulate   - What-if simulation")
-    print("  GET  /docs       - Interactive API documentation")
-    print("="*60 + "\n")
+    global scaler, label_encoders, columns, model
+
+    print("🚀 FastAPI starting on Azure")
+    print("🔄 Lazy-loading ML artifacts...")
+
+    try:
+        scaler = joblib.load(os.path.join(ARTIFACT_DIR, "torch_scaler.pkl"))
+        label_encoders = joblib.load(os.path.join(ARTIFACT_DIR, "torch_label_encoders.pkl"))
+        columns = joblib.load(os.path.join(ARTIFACT_DIR, "torch_columns.pkl"))
+
+        class ManufacturingNet(torch.nn.Module):
+            def __init__(self, input_dim):
+                super().__init__()
+                self.net = torch.nn.Sequential(
+                    torch.nn.Linear(input_dim, 64),
+                    torch.nn.ReLU(),
+                    torch.nn.BatchNorm1d(64),
+                    torch.nn.Dropout(0.2),
+                    torch.nn.Linear(64, 32),
+                    torch.nn.ReLU(),
+                    torch.nn.Dropout(0.2),
+                    torch.nn.Linear(32, 1)
+                )
+
+            def forward(self, x):
+                return self.net(x)
+
+        model = ManufacturingNet(len(columns))
+        state = torch.load(
+            os.path.join(ARTIFACT_DIR, "torch_failure_model_best.pt"),
+            map_location="cpu"
+        )
+        model.load_state_dict(state)
+        model.eval()
+
+        print("✅ ML model loaded successfully")
+
+    except Exception as e:
+        print("❌ Model loading failed:", str(e))
